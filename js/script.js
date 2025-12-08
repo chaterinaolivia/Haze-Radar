@@ -230,15 +230,25 @@ const HAZE_API_BASE_URL =
 const SUPABASE_URL = 'https://daxrnmvkpikjvvzgrhko.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRheHJubXZrcGlranZ2emdyaGtvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA2OTkyNjEsImV4cCI6MjA3NjI3NTI2MX0.XWJ_aWUh5Eci5tQSRAATqDXmQ5nh2eHQGzYu6qMcsvQ';
 
+function normalizeCityName(name) {
+    if (!name) return '';
+
+    return name
+        .toLowerCase()
+        .replace(/^kota\s+/i, '')
+        .replace(/^kab(?:upaten)?\.?\s+/i, '') // "Kab.", "Kabupaten"
+        .replace(/\s+kab\.?$/i, '')           // akhiran " Kab"
+        .replace(/\s*\(.+\)\s*$/, '')         // buang teks dalam kurung
+        .trim();
+}
+
+
+// Ambil 1 row terakhir di gnn_training_data untuk nama kota tertentu
 // Ambil 1 row terakhir di gnn_training_data untuk nama kota tertentu
 async function fetchSingleCityPredictionFromSupabase(cityName) {
     if (!cityName) return null;
 
-    // buang prefix "Kota"/"Kabupaten" supaya lebih gampang match
-    const trimmed = cityName
-        .replace(/^Kota\s+/i, '')
-        .replace(/^Kabupaten\s+/i, '')
-        .trim();
+    const trimmed = normalizeCityName(cityName);
 
     const params = new URLSearchParams({
         select: '*',
@@ -246,10 +256,12 @@ async function fetchSingleCityPredictionFromSupabase(cityName) {
         order: 'timestamp.desc',
     });
 
-    // ilike.*Palembang* → supaya "Kota Palembang" juga ketangkep
     params.append('city', `ilike.*${trimmed}*`);
 
     const url = `${SUPABASE_URL}/rest/v1/gnn_training_data?${params.toString()}`;
+
+    // 👉 kalau mau debug, log URL / trimmed aja dulu
+    console.log('Supabase lookup for:', trimmed, '→ url:', url);
 
     try {
         const resp = await fetch(url, {
@@ -265,6 +277,10 @@ async function fetchSingleCityPredictionFromSupabase(cityName) {
         }
 
         const rows = await resp.json();
+
+        // 👉 di sini baru aman pakai `rows`
+        console.log('Supabase rows for', trimmed, rows);
+
         if (!Array.isArray(rows) || !rows.length) {
             console.log('Supabase: no rows for', trimmed);
             return null;
@@ -273,14 +289,12 @@ async function fetchSingleCityPredictionFromSupabase(cityName) {
         const row = rows[0];
         console.log('Supabase row for', trimmed, row);
 
-        // Bentuk object yang friendly buat fungsi lain
         return {
             ...row,
             city: row.city || cityName,
             region: row.region,
             latitude: row.latitude,
             longitude: row.longitude,
-            // alias supaya kode lain bisa baca langsung
             predicted_pm25: row.target_pm25_24h,
             pm25: row.target_pm25_24h,
             current_aqi: row.current_aqi,
@@ -292,6 +306,7 @@ async function fetchSingleCityPredictionFromSupabase(cityName) {
         return null;
     }
 }
+
 
 const hazeAPI = {
     // Health check – root endpoint (sama persis dengan gnn_real_time.html)
@@ -523,18 +538,9 @@ function renderGNNCityMarkers(predictions) {
         marker.on('click', async () => {
             let analysis = { ...p }; // copy objek GNN
 
-            const pmIsZero =
-                (analysis.predicted_pm25 == null || Number(analysis.predicted_pm25) === 0) &&
-                (analysis.pm25 == null || Number(analysis.pm25) === 0);
-
-            const aqiIsZero =
-                (analysis.current_aqi == null || Number(analysis.current_aqi) === 0) &&
-                (analysis.aqi == null || Number(analysis.aqi) === 0);
-
-            // kalau GNN basically kosong → coba ambil dari Supabase
-            if (pmIsZero && aqiIsZero) {
-                const cityGuess = analysis.city || analysis.region || analysis.name;
-                const supaRow = await fetchSingleCityPredictionFromSupabase(cityGuess);
+            const cityGuess = analysis.city || analysis.region || analysis.name;
+            if (cityGuess) {
+                const supaRow = await getCityFromSupabaseCached(cityGuess);
                 if (supaRow) {
                     analysis = { ...analysis, ...supaRow };
                 }
@@ -542,6 +548,7 @@ function renderGNNCityMarkers(predictions) {
 
             applyAnalysisToHazeMatrix(analysis);
         });
+
 
 
         marker.addTo(layer);
@@ -1580,29 +1587,6 @@ async function renderAffectedAreas() {
             gnnPredictions.map(async (p) => {
                 const base = p.prediction || p;
 
-                const pmRaw =
-                    base.target_pm25_24h ??
-                    base.predicted_pm25 ??
-                    base.pm25 ?? base.pm_25 ?? null;
-
-                const aqiRaw =
-                    base.current_aqi ??
-                    base.predicted_aqi ??
-                    base.aqi ?? null;
-
-                const pmNum = pmRaw != null ? Number(pmRaw) : null;
-                const aqiNum = aqiRaw != null ? Number(aqiRaw) : null;
-
-                const looksEmpty =
-                    (pmRaw == null || Number.isNaN(pmNum) || pmNum === 0) &&
-                    (aqiRaw == null || Number.isNaN(aqiNum) || aqiNum === 0);
-
-                if (!looksEmpty) {
-                    // data GNN sudah oke → pakai apa adanya
-                    return p;
-                }
-
-                // Kalau kosong → coba ambil 1 baris terakhir dari Supabase
                 const cityGuess =
                     base.city || p.city ||
                     base.region || p.region ||
@@ -1611,10 +1595,11 @@ async function renderAffectedAreas() {
                 if (!cityGuess) return p;
 
                 const supaRow = await getCityFromSupabaseCached(cityGuess);
-                if (!supaRow) return p;
-
-                // Gabungkan data Supabase ke GNN (jangan buang field lain)
-                return { ...p, ...supaRow };
+                if (supaRow) {
+                    // Supabase override field kayak current_aqi, temperature, target_pm25_24h
+                    return { ...p, ...supaRow };
+                }
+                return p;
             })
         );
 
@@ -1630,13 +1615,11 @@ async function renderAffectedAreas() {
 
                 const status = category || 'Good';
 
-                // 👉 0 juga dianggap "nggak ada data", jadi tampilkan "-" saja
                 const aqiValue =
-                    aqi != null &&
-                        !Number.isNaN(Number(aqi)) &&
-                        Number(aqi) !== 0
+                    aqi != null && !Number.isNaN(Number(aqi))
                         ? Math.round(Number(aqi))
-                        : null; // nanti dirender jadi '-'
+                        : null;
+
 
                 return {
                     id: p.id ?? index + 1,
@@ -1714,25 +1697,15 @@ async function renderAffectedAreas() {
 
             let analysis = { ...nearest };
 
-            const pmIsZero =
-                (analysis.predicted_pm25 == null ||
-                    Number(analysis.predicted_pm25) === 0) &&
-                (analysis.pm25 == null || Number(analysis.pm25) === 0);
-
-            const aqiIsZero =
-                (analysis.current_aqi == null ||
-                    Number(analysis.current_aqi) === 0) &&
-                (analysis.aqi == null || Number(analysis.aqi) === 0);
-
-            if (pmIsZero && aqiIsZero) {
-                const cityGuess =
-                    analysis.city || analysis.region || analysis.name;
-                const supaRow =
-                    await getCityFromSupabaseCached(cityGuess);
+            const cityGuess =
+                analysis.city || analysis.region || analysis.name;
+            if (cityGuess) {
+                const supaRow = await getCityFromSupabaseCached(cityGuess);
                 if (supaRow) {
                     analysis = { ...analysis, ...supaRow };
                 }
             }
+
 
             applyAnalysisToHazeMatrix(analysis);
         });
